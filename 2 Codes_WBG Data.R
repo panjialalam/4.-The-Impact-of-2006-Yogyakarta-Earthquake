@@ -15,70 +15,16 @@ library(readxl)
 library(haven)
 library(fixest)
 library(lfe)
+library(car)
+library(lmtest)
+library(did)
+
+##--------------------------------------------------------------
+## Section 1: CPI Data Preparation
+##--------------------------------------------------------------
 
 file_path <- ("/Users/panjialalam/Documents/GitHub/4.-The-Impact-of-2006-Yogyakarta-Earthquake/Data/")
 
-##--------------------------------------------------------------
-## Section 1: Data Preparation
-##--------------------------------------------------------------
-cpi_file <- list.files(path = paste0(file_path, "BPS/BPS_CPI Java Districts"), 
-                       pattern = "*.xlsx", full.names = TRUE)
-district_java <- read_excel(paste0(file_path, "BPS/district_province.xlsx"), sheet = "java")
-
-# Read CPI data
-years <- 2000:2015
-data <- list()
-districts <- district_java |> # List of districts in Java, except Jakarta
-  pull(district)
-
-for (i in 1:length(cpi_file)) {
-  # Generate dynamic name for the data frames
-  df_name <- paste0("cpi_", years[i])
-  data[[i]] <- assign(df_name, read_excel(cpi_file[i]))
-  
-  # Add year column
-  data[[i]] <- data[[i]] |>
-    mutate(year = years[i])
-  
-  # Filter the districts
-  data[[i]] <- data[[i]] |>
-    filter(`Kota Inflasi` %in% districts)
-  
-  assign(df_name, data[[i]])
-}
-
-# Combine all years into one data frame
-cpi_java <- bind_rows(data)
-
-colnames(cpi_java) <- c(
-  "district", "January", "February", "March", "April", "May", "June",
-  "July", "August", "September", "October", "November", "December", "average", "year"
-)
-
-cpi_java <- cpi_java |>
-  mutate(across(January:December, ~ as.numeric(gsub("[^0-9.]", "", .)))) |>
-  rowwise() |>
-  mutate(average = mean(c_across(January:December), na.rm = TRUE)) |>
-  ungroup()
-
-# Join the districts and provinces
-cpi_java <- cpi_java |>
-  left_join(district_java, by = "district") |>
-  mutate(
-    base_year = case_when( # Add base years
-      year %in% c(2000, 2001, 2002, 2003) ~ 1996,
-      year %in% c(2004, 2005, 2006, 2007) ~ 2002,
-      year %in% c(2008, 2009, 2010, 2011, 2012, 2013) ~ 2007,
-      year %in% c(2014, 2015) ~ 2012
-    ))
-
-cpi_province <- cpi_java |> 
-  group_by(province, year, base_year) |> 
-  summarize(cpi = mean(average, na.rm = TRUE))
-
-##--------------------------------------------------------------
-## Section 2: GRDP Per Capita Data Preparation
-##--------------------------------------------------------------
 grdp_java <- read_excel(paste0(file_path, "WBG/GDP_IndoDapoer.xlsx"), sheet = "Data")
 
 grdp_java <- grdp_java |>
@@ -86,9 +32,9 @@ grdp_java <- grdp_java |>
                               "Total Population (in number of people)")) |>
   mutate(
     across(everything(), ~ na_if(., ".."))
-    )
+  )
 
-colnames(grdp_java) <- gsub("\\s*\\[YR[0-9]{4}\\]", "", colnames(grdp_java)) # Simplify the column names
+colnames(grdp_java) <- gsub("\\s*\\[YR[0-9]{4}\\]", "", colnames(grdp_java))
 
 # Transform the data
 grdp_pivot <- grdp_java |>
@@ -113,7 +59,7 @@ grdpc_java <- grdp_pivot |>
     total_grdp = as.numeric(total_grdp),
     total_pop = as.numeric(total_pop),
     grdp_percapita = total_grdp / total_pop
-    ) |>
+  ) |>
   group_by(`Provinces Name`) |>
   mutate(
     perc_change_grdpc = ((grdp_percapita / lag(grdp_percapita)) - 1) * 100,
@@ -134,12 +80,251 @@ grdpc_quake <- grdpc_java |>
     year = as.numeric(year),
     post = if_else(year < 2006, 0, 1),
     earthquake = if_else(
-      `Provinces Name` %in% earthuake_districts, 1, 0
-    )
+      `Provinces Name` %in% earthuake_districts, 1, 0),
+    earthquake_year = if_else(
+      `Provinces Name` %in% earthuake_districts, 2006, 0)
+  ) |>
+  mutate(
+    city_district = ifelse(grepl("Kota", `Provinces Name`), 1, 0)
+  )
+
+# Create the interaction term between earthquake and post
+grdpc_quake <- grdpc_quake |>
+  mutate(D = case_when(earthquake == 1 & post == 1 ~ 1,
+                       earthquake == 1 & post == 0 ~ 0,
+                       earthquake == 0 ~ 0))
+
+##--------------------------------------------------------------
+## Section 2a: Covariates Data Preparation
+##--------------------------------------------------------------
+
+# 1. Population
+# --------------------------------------------------------------
+population <- read_excel(paste0(file_path, "WBG/Population_IndoDapoer.xlsx"), sheet = "Data")
+
+colnames(population) <- gsub("\\s*\\[YR[0-9]{4}\\]", "", colnames(population))
+
+# Add ovariates: total population, urban population percentage
+urban_pop <- population |> 
+  mutate(
+    across(where(is.character), ~ na_if(., "..")),
+    across(`2000`:`2015`, as.numeric)
+  ) |>
+  select(!c(`2014`, `2015`)) |>
+  pivot_longer(
+    cols = `2000`:`2013`,
+    names_to = "year",
+    values_to = "value") |>
+  pivot_wider(
+    id_cols = c(`Level`, `Provinces Name`, year),
+    names_from = `Series Name`,
+    values_from = "value"
+  ) |>
+  rename(
+    urban_perc = `Percentage of Population in Urban Areas (in % of Total Population), SUSENAS`,
+    total_pop = `Total Population (in number of people)`
+  ) |>
+  mutate(
+    year = as.numeric(year)
+  )
+
+# Add covariates: population growth
+urban_pop <- urban_pop |>
+  group_by(`Provinces Name`) |>
+  mutate(
+    total_pop_growth = (total_pop - lag(total_pop)) / lag(total_pop)
+  ) |>
+  ungroup()
+
+# 2. GDP sectoral
+# --------------------------------------------------------------
+gdp_sector <- read_excel(paste0(file_path, "WBG/GDP_Sector_IndoDapoer.xlsx"), sheet = "Data")
+
+colnames(gdp_sector) <- gsub("\\s*\\[YR[0-9]{4}\\]", "", colnames(gdp_sector))
+
+gdp_sector <- gdp_sector |> 
+  mutate(
+    across(where(is.character), ~ na_if(., "..")),
+    across(`2000`:`2015`, as.numeric)
+  ) |>
+  select(!c(`2014`, `2015`)) |>
+  pivot_longer(
+    cols = `2000`:`2013`,
+    names_to = "year",
+    values_to = "gdp") |>
+  pivot_wider(
+    id_cols = c(`Level`, `Provinces Name`, year),
+    names_from = `Series Name`,
+    values_from = "gdp"
+  ) |>
+  mutate(
+    year = as.numeric(year)
+  )
+
+gdp_sector <- gdp_sector |>
+  rename(
+    agriculture = `GDP on Agriculture Sector (in IDR Million), Constant Price`,
+    construction = `GDP on Construction Sector (in IDR Million), Constant Price`,
+    finance = `GDP on Financial Service Sector (in IDR Million), Constant Price`,
+    manufacturing = `GDP on Manufacturing Sector (in IDR Million), Constant Price`,
+    other_service = `GDP on Other Service Sector (in IDR Million), Constant Price`,
+    mining = `GDP on Mining and Quarrying Sector (in IDR Million), Constant Price`,
+    trade_accomm = `GDP on Trade, Hotel and Restaurant Sector (in IDR Million), Constant Price`,
+    transport_telecom = `GDP on Transportation and Telecommunication Sector (in IDR Million), Constant Price`,
+    utilities = `GDP on Utilities Sector (in IDR Million), Constant Price`
+  )
+
+# Add covariates: Three-sector model
+gdp_sector_aggregate <- gdp_sector |>
+  mutate(
+    primary_sector = (agriculture + mining + utilities),
+    secondary_sector = (manufacturing + construction),
+    tertiary_sector = (trade_accomm + transport_telecom + finance + other_service),
+    year = as.numeric(year)
+  ) |>
+  mutate(
+    total_gdp_sector = primary_sector + secondary_sector + tertiary_sector,
+    primary_percent = (primary_sector / total_gdp_sector),
+    secondary_percent = (secondary_sector / total_gdp_sector),
+    tertiary_percent = (tertiary_sector / total_gdp_sector)
+  )
+
+# 3. Transfers and revenues
+# --------------------------------------------------------------
+transfer <- read_excel(paste0(file_path, "WBG/Revenue_IndoDapoer.xlsx"), sheet = "Data")
+
+colnames(transfer) <- gsub("\\s*\\[YR[0-9]{4}\\]", "", colnames(transfer))
+
+transfer <- transfer |> 
+  mutate(
+    across(where(is.character), ~ na_if(., "..")),
+    across(`2000`:`2015`, as.numeric)
+  ) |>
+  select(!c(`2014`, `2015`)) |>
+  pivot_longer(
+    cols = `2000`:`2013`,
+    names_to = "year",
+    values_to = "value") |>
+  pivot_wider(
+    id_cols = c(`Level`, `Provinces Name`, year),
+    names_from = `Series Name`,
+    values_from = "value"
+  ) |>
+  select(!c(`Total Specific Allocation Grant for Agriculture (in IDR Billion)`,
+            `Total Specific Allocation Grant for Demographic (in IDR Billion)`,
+            `Total Specific Allocation Grant for Environment (in IDR Billion)`,
+            `Total Specific Allocation Grant for Health (in IDR Billion)`,
+            `Total Specific Allocation Grant for Infrastructure (in IDR Billion)`,
+            `Total Natural Resources Revenue Sharing from Oil (in IDR, realization value)`,
+            `Total Natural Resources Revenue Sharing from Mining (in IDR, realization value)`,
+            `Total Natural Resources Revenue Sharing from Forestry (in IDR, realization value)`)) |>
+  mutate(
+    year = as.numeric(year)
+  )
+
+transfer_revenue <- transfer |>
+  rename(
+    general_alloc = `Total General Allocation Grant/DAU (in IDR)`,
+    special_alloc = `Total Special Allocation Grant/DAK (in IDR)`,
+    resource_rev_share = `Total Natural Resource Revenue Sharing/DBH SDA (in IDR)`,
+    tax_rev_share = `Total Tax Revenue Sharing/DBH Pajak (in IDR)`,
+    own_source_rev = `Total Own Source Revenue/PAD (in IDR)`,
+    total_rev = `Total Revenue (in IDR)`,
+    total_rev_share = `Total Revenue Sharing`
+  )
+
+# 4. Area
+# --------------------------------------------------------------
+area <- read_excel(paste0(file_path, "WBG/Area_IndoDapoer.xlsx"), sheet = "Data")
+
+colnames(area) <- gsub("\\s*\\[YR[0-9]{4}\\]", "", colnames(area))
+
+district_area <- area |> 
+  mutate(
+    across(where(is.character), ~ na_if(., "..")),
+    across(`2000`:`2015`, as.numeric)
+  ) |>
+  select(!c(`2014`, `2015`)) |>
+  pivot_longer(
+    cols = `2000`:`2013`,
+    names_to = "year",
+    values_to = "value") |>
+  pivot_wider(
+    id_cols = c(`Level`, `Provinces Name`, year),
+    names_from = `Series Name`,
+    values_from = "value"
+  ) |>
+  rename(
+    area = `Total Area (in Km²)`) |>
+  mutate(
+    year = as.numeric(year)
+  )
+
+# Join the data frames to add covariates
+merged_data <- grdpc_quake |>
+  left_join(urban_pop, by = c("Level", "Provinces Name", "year")) |>
+  left_join(gdp_sector_aggregate, by = c("Level", "Provinces Name", "year")) |>
+  left_join(transfer_revenue, by = c("Level", "Provinces Name", "year")) |>
+  left_join(district_area, by = c("Level", "Provinces Name", "year")) |>
+  select(-total_pop.y) |>
+  rename(
+    total_pop = total_pop.x
+  )
+
+grdpc_data_sectoral <- merged_data |>
+  mutate(
+    grdpc_primary_sector = grdp_percapita * primary_percent,
+    grdpc_secondary_sector = grdp_percapita * secondary_percent,
+    grdpc_tertiary_sector = grdp_percapita * tertiary_percent
+  ) |>
+  rename(
+    province = `Level`,
+    district = `Provinces Name`
+  ) |>
+  select(
+    province, district, year, earthquake, post, everything()
+  ) |>
+  mutate(district_id = dense_rank(district))
+
+# Calculate population density
+grdpc_data_sectoral <- grdpc_data_sectoral |>
+  mutate(
+    pop_density = total_pop / area
+  )
+
+# Add lag GRDP per capita
+grdpc_data_sectoral <- grdpc_data_sectoral |> 
+  arrange(district, year) |> 
+  group_by(district) |> 
+  mutate(grdp_percapita_lag = lag(grdp_percapita))
+
+# Data structure examination
+na_counts_df <- grdpc_data_sectoral |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(cols = province:grdpc_tertiary_sector, 
+               names_to = "variable", 
+               values_to = "missing") |>
+  group_by(variable) |>
+  summarize(
+    missing = sum(missing)
+  )
+
+# Quick data check
+check_na <- grdpc_data_sectoral |>
+  filter(is.na(resource_rev_share)) |>
+  select(district, year, resource_rev_share)
+
+missing_summary <- grdpc_data_sectoral |>
+  summarize(across(everything(), ~ sum(is.na(.)))) |>
+  group_by(district) |>
+  pivot_longer(
+    cols = province:grdp_percapita_lag,
+    names_to = "variables",
+    values_to = "missing"
   )
 
 ##--------------------------------------------------------------
-## Section 3: Assumption Check
+## Section 2a: Assumption Check (Plotting)
 ##--------------------------------------------------------------
 
 # Visual analysis
@@ -192,71 +377,239 @@ model <- lm(grdp_percapita ~ earthquake * year, data = grdpc_pre)
 summary(model)
 
 ##--------------------------------------------------------------
-## Section 4: Regression Models
+## Section 2b: Assumption Check (Event Study Design)
 ##--------------------------------------------------------------
 
-# Calculate the Difference in Means
-post_treat <- grdpc_quake |>
-  group_by(earthquake, post) |>
-  summarize(
-    avg = mean(grdp_percapita, na.rm = TRUE)
-  )
+# Prepare event study data
+event_study_data <- grdpc_data_sectoral |>  
+  mutate(ever_treated = ifelse(earthquake == 1, 1, 0),  
+         event_time = year - 2006, 
+         D = factor(ifelse(earthquake == 1, event_time, 0)), 
+         D = relevel(D, ref = "-1")) 
 
-(post_treat$avg[4] - post_treat$avg[3]) - (post_treat$avg[2] - post_treat$avg[1])
+event_study_reg <- felm(grdp_percapita ~ D +  
+                          total_pop + urban_perc | district + year | 0 | district,  
+                        data = event_study_data)
 
-# Simple regression model (model specification)
-dd_reg <- lm(grdp_percapita ~ earthquake + post + earthquake * post,
-             data = grdpc_quake)
-summary(dd_reg)
+summary(event_study_reg)
 
-# Fixed effect regression
-grdpc_quake <- grdpc_quake |>
+# Event study plot
+res <- as.data.frame(summary(event_study_reg)$coefficients)
+res$low <- res$Estimate - qnorm(1 - 0.05/2)*res$`Cluster s.e.`
+res$high <- res$Estimate + qnorm(1 - 0.05/2)*res$`Cluster s.e.`
+
+res <- res |>
+  slice(1:(n() - 2)) |>
+  mutate(
+    event_time_value = c(0, -6:-2, 1:7))
+
+res <- res |> 
+  select(Estimate, event_time_value, low, high)
+
+omitted <- data.frame("Estimate" = 0, 
+                      "event_time_value" = -1, # Add an observation for event time -1
+                      "low" = 0,
+                      "high" = 0)
+
+res <- res |> 
+  rbind(omitted) |>
+  arrange(event_time_value)
+
+res |> 
+  ggplot(aes(x = event_time_value, y = Estimate)) + 
+  geom_point(color = "black") + 
+  geom_line(color = "firebrick") + 
+  geom_errorbar(aes(ymin = low, ymax = high), width = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  scale_x_continuous(breaks = unique(res$event_time_value)) + 
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Coefficient estimate graph",
+    x = "Years relative to 2006",
+    y = "Estimate"
+  ) + 
+  theme_minimal()
+
+# Check for multicollinearity among event time variables
+summary(event_study_data$event_time)
+table(event_study_data$event_time, event_study_data$D)
+
+# Check using DiD package by Callaway
+reg_did <- att_gt(
+  yname = "grdp_percapita",
+  gname = "earthquake_year",
+  idname = "district_id",
+  tname = "year",
+  xformla = ~1,
+  data = grdpc_data_sectoral,
+  est_method = "reg"
+)
+
+summary(reg_did)
+
+es <- aggte(reg_did, type = "dynamic")
+ggdid(es)
+
+##--------------------------------------------------------------
+## Section 3a: Regression Models
+##--------------------------------------------------------------
+
+# 1. Fixed effect regression model (full model)
+# --------------------------------------------------------------
+
+# With no control 
+fe_reg_controls <- felm(grdp_percapita ~ D | district + year | 0 | district,  
+                        data = grdpc_data_sectoral)
+
+# With controls and clustered in district-level
+fe_reg_controls <- felm(grdp_percapita ~ D + area + tax_rev_share +
+                          total_pop + urban_perc + general_alloc + special_alloc +
+                          own_source_rev | district + year | 0 | district,  
+                        data = grdpc_data_sectoral)
+
+summary(fe_reg_controls)
+
+# Separate regression for cities and districts
+fe_reg_interaction <- felm(grdp_percapita ~ D * city_district + area + tax_rev_share +
+                             total_pop + urban_perc + general_alloc + special_alloc +
+                             own_source_rev | district + year | 0 | district,
+                           data = grdpc_data_sectoral)
+
+summary(fe_reg_interaction)
+
+##--------------------------------------------------------------
+## Section 4b: Sectoral Regression Models
+##--------------------------------------------------------------
+
+# Primary sector
+grdpc_data_sectoral <- grdpc_data_sectoral |>
+  mutate(grdpc_primary_lag = lag(grdpc_primary_sector),
+         grdpc_secondary_lag = lag(grdpc_secondary_sector),
+         grdpc_tertiary_lag = lag(grdpc_tertiary_sector))
+
+
+fe_reg_primary <- felm(grdpc_primary_sector ~ D + area + tax_rev_share +
+                         total_pop + urban_perc + general_alloc + special_alloc +
+                         own_source_rev | district + year | 0 | district,  
+                       data = grdpc_data_sectoral)
+
+summary(fe_reg_primary)
+
+# Secondary sector
+fe_reg_secondary <- felm(grdpc_secondary_sector ~ D + area + tax_rev_share +
+                           total_pop + urban_perc + general_alloc + special_alloc +
+                           own_source_rev | district + year | 0 | district,  
+                         data = grdpc_data_sectoral)
+
+summary(fe_reg_secondary)
+
+# Tertiary sector
+fe_reg_tertiary <- felm(grdpc_secondary_sector ~ D + area + tax_rev_share +
+                          total_pop + urban_perc + general_alloc + special_alloc +
+                          own_source_rev | district + year | 0 | district,  
+                        data = grdpc_data_sectoral)
+
+summary(fe_reg_secondary)
+
+##--------------------------------------------------------------
+## Section 5: Robustness Checks
+##--------------------------------------------------------------
+
+# 1. Check for multicollinearity
+# --------------------------------------------------------------
+vif(lm(grdp_percapita ~ D + area + tax_rev_share +
+         total_pop + urban_perc + general_alloc + special_alloc + 
+         own_source_rev,
+       data = grdpc_data_sectoral))
+
+# 2. Check for heteroskedasticity
+# --------------------------------------------------------------
+bp_test <- bptest(lm(grdp_percapita ~ D + area + tax_rev_share +
+                       total_pop + urban_perc + general_alloc + special_alloc + 
+                       own_source_rev, 
+                     data = grdpc_data_sectoral))
+
+print(bp_test)
+
+# Cluster at province-level
+fe_reg_province <- felm(grdp_percapita ~ D + area + tax_rev_share +
+                          total_pop + urban_perc + general_alloc + special_alloc +
+                          own_source_rev | province + year | 0 | province,  
+                        data = grdpc_data_sectoral)
+
+summary(fe_reg_province)
+
+
+# 3. Placebo test
+# --------------------------------------------------------------
+placebo_data <- grdpc_data_sectoral |>
+  mutate(
+    post = if_else(year < 2010, 0, 1)
+  ) |>
   mutate(D = case_when(earthquake == 1 & post == 1 ~ 1,
                        earthquake == 1 & post == 0 ~ 0,
                        earthquake == 0 ~ 0))
 
-fe_reg <- felm(grdp_percapita ~ D|`Provinces Name` + year|0|`Provinces Name`,
-               data = grdpc_quake)
-summary(fe_reg)
 
-##--------------------------------------------------------------
-## Section 4a: Event Study Design
-##--------------------------------------------------------------
+# Placebo data fixed-effect regression
+fe_reg_placebo <- felm(grdp_percapita ~ D + area + tax_rev_share + resource_rev_share +
+                         total_pop + urban_perc + general_alloc + special_alloc +
+                         own_source_rev | district + year | 0 | district,
+                       data = placebo_data)
 
-event_study <- grdpc_quake |>
-  mutate(ever_treated = case_when(earthquake == 1 ~ 1,
-                                  earthquake == 0 ~ 0),
-         event_time = ifelse(earthquake == 1, year - 2006, 0),
-         D = factor(ever_treated * event_time),
-         D = relevel(D, ref = "-1"))
+summary(fe_reg_placebo)
 
-fe_reg2 <- felm(grdp_percapita ~ D|`Provinces Name` + year|0|`Provinces Name`, 
-                data = event_study)
-summary(fe_reg2)
+fe_reg_placebo <- felm(grdp_percapita ~ D | district + year | 0 | district,
+                       data = placebo_data)
 
-# Event study plot
-res <- as.data.frame(summary(fe_reg2)$coefficients)
+summary(fe_reg_placebo)
+
+placebo_event_study <- placebo_data |>  
+  mutate(ever_treated = ifelse(earthquake == 1, 1, 0),  
+         event_time = year - 2003, 
+         D = factor(ifelse(earthquake == 1, event_time, 0)), 
+         D = relevel(D, ref = "-1")) 
+
+event_reg_placebo <- felm(grdp_percapita ~ D +
+                            total_pop + urban_perc | district + year | 0 | province,
+                          data = placebo_event_study)
+
+summary(event_reg_placebo)
+
+res <- as.data.frame(summary(event_reg_placebo)$coefficients)
 res$low <- res$Estimate - qnorm(1 - 0.05/2)*res$`Cluster s.e.`
 res$high <- res$Estimate + qnorm(1 - 0.05/2)*res$`Cluster s.e.`
-res$event_time_value <- c(-6:-2, 0:7)
-res <- res %>% dplyr::select(Estimate, event_time_value, low, high)
+
+res <- res |>
+  slice(1:(n() - 2)) |>
+  mutate(
+    event_time_value = c(0, -3:-2, 1:10))
+
+res <- res |> 
+  select(Estimate, event_time_value, low, high)
 
 omitted <- data.frame("Estimate" = 0, 
-                      "event_time_value" = -1,
+                      "event_time_value" = -1, # Add an observation for event time -1
                       "low" = 0,
                       "high" = 0)
-res <- res |> rbind(omitted)
 
-res |>
+res <- res |> 
+  rbind(omitted) |>
+  arrange(event_time_value)
+
+res |> 
   ggplot(aes(x = event_time_value, y = Estimate)) + 
-  geom_point() +
-  geom_line() +
-  scale_x_continuous(breaks = res$event_time_value) +
+  geom_point(color = "black") + 
+  geom_line(color = "firebrick") + 
+  geom_errorbar(aes(ymin = low, ymax = high), width = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  scale_x_continuous(breaks = unique(res$event_time_value)) + 
+  scale_y_continuous(labels = scales::comma) +
   labs(
-    title = "Coefficient estimate graph",
-    x = "Event time value",
+    title = "Coefficient estimate graph (Placebo test)",
+    x = "Years relative to 2006",
     y = "Estimate"
-  ) +
+  ) + 
   theme_minimal()
 
 # Check trends for earthquake districts
@@ -296,4 +649,3 @@ ggplot(grdpc_check, aes(x = year, y = grdp_percapita, color = `Provinces Name`, 
     plot.title = element_text(hjust = 0.5),
     legend.position = "none"
   )
-
