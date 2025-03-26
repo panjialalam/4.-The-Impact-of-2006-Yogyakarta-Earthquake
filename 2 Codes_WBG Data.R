@@ -18,6 +18,8 @@ library(lfe)
 library(car)
 library(lmtest)
 library(did)
+library(foreign)
+library(Synth)
 
 ##--------------------------------------------------------------
 ## Section 1: CPI Data Preparation
@@ -70,19 +72,19 @@ grdpc_java <- grdp_pivot |>
   ungroup()
 
 # Mark the earthquake districts and before-after earthquake
-earthuake_districts <- c("Bantul, Kab.", "Gunung Kidul, Kab.", "Kulon Progo, Kab.",
-                         "Sleman, Kab.", "Yogyakarta, Kota", "Purworejo, Kab.",
-                         "Magelang, Kab.", "Magelang, Kota", "Boyolali, Kab.",
-                         "Klaten, Kab.", "Sukoharjo, Kab.", "Wonogiri, Kab.")
+earthquake_districts <- c("Bantul, Kab.", "Gunung Kidul, Kab.", "Kulon Progo, Kab.",
+                          "Sleman, Kab.", "Yogyakarta, Kota", "Purworejo, Kab.",
+                          "Magelang, Kab.", "Magelang, Kota", "Boyolali, Kab.",
+                          "Klaten, Kab.", "Sukoharjo, Kab.", "Wonogiri, Kab.")
 
 grdpc_quake <- grdpc_java |>
   mutate(
     year = as.numeric(year),
     post = if_else(year < 2006, 0, 1),
     earthquake = if_else(
-      `Provinces Name` %in% earthuake_districts, 1, 0),
+      `Provinces Name` %in% earthquake_districts, 1, 0),
     earthquake_year = if_else(
-      `Provinces Name` %in% earthuake_districts, 2006, 0)
+      `Provinces Name` %in% earthquake_districts, 2006, 0)
   ) |>
   mutate(
     city_district = ifelse(grepl("Kota", `Provinces Name`), 1, 0)
@@ -284,7 +286,15 @@ grdpc_data_sectoral <- merged_data |>
   select(
     province, district, year, earthquake, post, everything()
   ) |>
-  mutate(district_id = dense_rank(district))
+  mutate(district_id = as.numeric(dense_rank(district)),
+         year = as.numeric(year)
+  ) |>
+  relocate(
+    district_id, .after = district
+  ) |>
+  relocate(
+    D, .after = post
+  )
 
 # Calculate population density
 grdpc_data_sectoral <- grdpc_data_sectoral |>
@@ -457,7 +467,7 @@ ggdid(es)
 # 1. Fixed effect regression model (full model)
 # --------------------------------------------------------------
 
-# With no control 
+# With no control and clustered in district-level
 fe_reg_controls <- felm(grdp_percapita ~ D | district + year | 0 | district,  
                         data = grdpc_data_sectoral)
 
@@ -469,7 +479,7 @@ fe_reg_controls <- felm(grdp_percapita ~ D + area + tax_rev_share +
 
 summary(fe_reg_controls)
 
-# Separate regression for cities and districts
+# I
 fe_reg_interaction <- felm(grdp_percapita ~ D * city_district + area + tax_rev_share +
                              total_pop + urban_perc + general_alloc + special_alloc +
                              own_source_rev | district + year | 0 | district,
@@ -544,7 +554,7 @@ summary(fe_reg_province)
 # --------------------------------------------------------------
 placebo_data <- grdpc_data_sectoral |>
   mutate(
-    post = if_else(year < 2010, 0, 1)
+    post = if_else(year < 2003, 0, 1)
   ) |>
   mutate(D = case_when(earthquake == 1 & post == 1 ~ 1,
                        earthquake == 1 & post == 0 ~ 0,
@@ -607,7 +617,7 @@ res |>
   scale_y_continuous(labels = scales::comma) +
   labs(
     title = "Coefficient estimate graph (Placebo test)",
-    x = "Years relative to 2006",
+    x = "Years relative to 2003",
     y = "Estimate"
   ) + 
   theme_minimal()
@@ -649,3 +659,236 @@ ggplot(grdpc_check, aes(x = year, y = grdp_percapita, color = `Provinces Name`, 
     plot.title = element_text(hjust = 0.5),
     legend.position = "none"
   )
+
+##--------------------------------------------------------------
+## Section 6: Synthetic Control Method
+##--------------------------------------------------------------
+
+# Create the data frame only type of data
+is.data.frame(grdpc_data_sectoral)
+class(grdpc_data_sectoral)
+
+grdpc_synth <- as.data.frame(grdpc_data_sectoral)
+is.data.frame(grdpc_synth)
+class(grdpc_synth)
+
+##--------------------------------------------------------------
+## Section 6a: Synthetic Control Method (Bantul district)
+##--------------------------------------------------------------
+
+# Get earthquake districts other than Kabupaten Bantul
+earthquake_district_id <- grdpc_synth |>
+  filter(district %in% earthquake_districts & district_id != 7) |>
+  pull(district_id) |>
+  unique()
+
+# Get the invalid controls due to missing data in GRDP per capita
+invalid_controls <- grdpc_synth |>
+  select(c(district_id, district, grdp_percapita, total_pop, urban_perc)) |>
+  filter(is.na(grdp_percapita),
+         is.na(total_pop),
+         is.na(urban_perc)) |>
+  pull(district_id) |>
+  unique()
+
+# Set the valid controls district
+all_controls <- grdpc_synth |>
+  pull(district_id) |>
+  unique()
+
+valid_controls <- setdiff(all_controls, earthquake_district_id)
+valid_controls <- setdiff(all_controls, invalid_controls)
+valid_controls <- setdiff(valid_controls, 7)
+
+# Set up the SCM
+dataprep_out <- dataprep(
+  foo = grdpc_synth,
+  predictors = c("grdp_percapita", "total_pop", "urban_perc"),
+  special.predictors = list(
+    list("general_alloc", 2006:2013, c("mean")),
+    list("area", 2006, c("mean")),
+    list("own_source_rev", 2006, c("median")),
+    list("tax_rev_share", 2006, c("median"))
+  ),
+  dependent = "grdp_percapita",
+  unit.variable = "district_id",
+  time.variable = "year",
+  treatment.identifier = 7,
+  controls.identifier = valid_controls, 
+  time.predictors.prior = 2000:2005,
+  time.optimize.ssr = 2000:2005,
+  unit.names.variable = "district",
+  time.plot = 2000:2013
+)
+
+synth_out <- synth(dataprep_out)
+
+path.plot(synth.res = synth_out,
+          dataprep.res = dataprep_out,
+          tr.intake = 2006,
+          Ylab = "Per capita GDP",
+          Xlab = "Year",
+          Legend = c("Bantul District", "Synth. Bantul District"),
+          Main = "Bantul District vs Synth. Bantul District")
+
+gaps.plot(synth.res = synth_out,
+          dataprep.res = dataprep_out,
+          tr.intake = 2006,
+          Ylab = "Effect",
+          Xlab = "Year",
+          Main = " Gap between per capita GDP in Bantul District and its synthetic version")
+
+##--------------------------------------------------------------
+## Section 6b: Synthetic Control Method (Klaten district)
+##--------------------------------------------------------------
+
+# Get earthquake districts other than Kabupaten Bantul
+earthquake_district_id <- grdpc_synth |>
+  filter(district %in% earthquake_districts & district_id != 46) |>
+  pull(district_id) |>
+  unique()
+
+# Get the invalid controls due to missing data in GRDP per capita
+invalid_controls <- grdpc_synth |>
+  select(c(district_id, district, grdp_percapita, total_pop, urban_perc)) |>
+  filter(is.na(grdp_percapita),
+         is.na(total_pop),
+         is.na(urban_perc)) |>
+  pull(district_id) |>
+  unique()
+
+# Set the valid controls district
+all_controls <- grdpc_synth |>
+  pull(district_id) |>
+  unique()
+
+valid_controls <- setdiff(all_controls, earthquake_district_id)
+valid_controls <- setdiff(all_controls, invalid_controls)
+valid_controls <- setdiff(valid_controls, 46)
+
+# Set up the SCM
+dataprep_out <- dataprep(
+  foo = grdpc_synth,
+  predictors = c("grdp_percapita", "total_pop", "urban_perc"),
+  special.predictors = list(
+    list("general_alloc", 2006:2013, c("mean")),
+    list("area", 2006, c("mean")),
+    list("own_source_rev", 2006, c("median")),
+    list("tax_rev_share", 2006, c("median"))
+  ),
+  dependent = "grdp_percapita",
+  unit.variable = "district_id",
+  time.variable = "year",
+  treatment.identifier = 46,
+  controls.identifier = valid_controls, 
+  time.predictors.prior = 2000:2005,
+  time.optimize.ssr = 2000:2005,
+  unit.names.variable = "district",
+  time.plot = 2000:2013
+)
+
+synth_out <- synth(dataprep_out)
+
+path.plot(synth.res = synth_out,
+          dataprep.res = dataprep_out,
+          tr.intake = 2006,
+          Ylab = "Per capita GDP",
+          Xlab = "Year",
+          Legend = c("Klaten District", "Synth. Klaten District"),
+          Main = "Klaten District vs Synth. Klaten District")
+
+gaps.plot(synth.res = synth_out,
+          dataprep.res = dataprep_out,
+          tr.intake = 2006,
+          Ylab = "Effect",
+          Xlab = "Year",
+          Main = " Gap between per capita GDP in Klaten District and its synthetic version")
+
+##--------------------------------------------------------------
+## Section 6c: Synthetic Control Method (Bantul and Klaten)
+##--------------------------------------------------------------
+
+# Create a new treated unit
+treated_avg <- grdpc_data_sectoral |>
+  filter(district %in% c("Bantul, Kab.", "Klaten, Kab.")) |>
+  group_by(year) |>
+  summarise(
+    district = "Treated_Pooled",
+    district_id = 999,
+    grdp_percapita = mean(grdp_percapita, na.rm = TRUE),
+    total_pop = mean(total_pop, na.rm = TRUE),
+    urban_perc = mean(urban_perc, na.rm = TRUE),
+    tax_rev_share = mean(tax_rev_share, na.rm = TRUE),
+    own_source_rev = mean(own_source_rev, na.rm = TRUE),
+    general_alloc = mean(general_alloc, na.rm = TRUE),
+    special_alloc = mean(special_alloc, na.rm = TRUE)
+  )
+
+grdpc_synth_pool <- grdpc_data_sectoral |>
+  select(
+    "year", "district", "district_id", "grdp_percapita",
+    "total_pop", "urban_perc", "tax_rev_share", "own_source_rev",
+    "general_alloc", "special_alloc"
+  ) |>
+  filter(
+    (!district %in% c("Bantul, Kab.", "Klaten, Kab."))
+  ) |>
+  bind_rows(treated_avg)
+
+grdpc_synth_pool <- as.data.frame(grdpc_synth_pool)
+
+# Get earthquake districts other than Kabupaten Bantul
+earthquake_district_id <- grdpc_synth_pool |>
+  filter(district %in% earthquake_districts & district_id != 999) |>
+  pull(district_id) |>
+  unique()
+
+# Get the invalid controls due to missing data in GRDP per capita
+invalid_controls <- grdpc_synth_pool |>
+  select(c(district_id, district, grdp_percapita, total_pop, urban_perc)) |>
+  filter(is.na(grdp_percapita),
+         is.na(total_pop),
+         is.na(urban_perc)) |>
+  pull(district_id) |>
+  unique()
+
+# Set the valid controls district
+all_controls <- grdpc_synth_pool |>
+  pull(district_id) |>
+  unique()
+
+valid_controls <- setdiff(all_controls, earthquake_district_id)
+valid_controls <- setdiff(all_controls, invalid_controls)
+valid_controls <- setdiff(valid_controls, 999)
+
+# Set up the SCM
+dataprep_out <- dataprep(
+  foo = grdpc_synth_pool,
+  predictors = c("grdp_percapita", "total_pop", "urban_perc"),
+  dependent = "grdp_percapita",
+  unit.variable = "district_id",
+  time.variable = "year",
+  treatment.identifier = 999,
+  controls.identifier = valid_controls, 
+  time.predictors.prior = 2000:2005,
+  time.optimize.ssr = 2000:2005,
+  unit.names.variable = "district",
+  time.plot = 2000:2013
+)
+
+synth_out <- synth(dataprep_out)
+
+path.plot(synth.res = synth_out,
+          dataprep.res = dataprep_out,
+          tr.intake = 2006,
+          Ylab = "Per capita GDP",
+          Xlab = "Year",
+          Legend = c("Earthquake Districts", "Synth. Earthquake Districts"),
+          Main = "Earthquake Districts vs Synth. Earthquake Districts")
+
+gaps.plot(synth.res = synth_out,
+          dataprep.res = dataprep_out,
+          tr.intake = 2006,
+          Ylab = "Effect",
+          Xlab = "Year",
+          Main = " Gap between per capita GDP in Earthquake Districts and its synthetic version")
